@@ -253,6 +253,53 @@ export default {
         return json(result);
       }
 
+      // ─── Achievements ─────────────────────────────────
+      // POST /api/achievements/unlock — record an achievement unlock
+      if (path === "/api/achievements/unlock" && method === "POST") {
+        const body = await parseBody(request);
+        const playerName = String(body.player_name || "");
+        const achievementId = String(body.achievement_id || "");
+        if (!playerName || !achievementId) {
+          return error("player_name and achievement_id are required");
+        }
+        const unlockedAt = Number(body.unlocked_at ?? Math.floor(Date.now() / 1000));
+
+        try {
+          await env.DB.prepare(
+            `INSERT INTO achievements (player_name, achievement_id, unlocked_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(player_name, achievement_id) DO NOTHING`
+          ).bind(playerName, achievementId, unlockedAt).run();
+          return json({ success: true, player_name: playerName, achievement_id: achievementId });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown error";
+          if (message.includes("no such table")) {
+            return error("Achievements table not created. Run schema-achievements.sql.", 500);
+          }
+          return error(message, 500);
+        }
+      }
+
+      // GET /api/achievements/:player — get all achievements for a player
+      if (path.startsWith("/api/achievements/") && method === "GET") {
+        const playerName = decodeURIComponent(path.split("/api/achievements/")[1]);
+        if (!playerName) return error("player name is required");
+
+        try {
+          const results = await env.DB.prepare(
+            `SELECT achievement_id, unlocked_at FROM achievements WHERE player_name = ? ORDER BY unlocked_at ASC`
+          ).bind(playerName).all();
+
+          return json({ achievements: results.results || [] });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : "Unknown error";
+          if (message.includes("no such table")) {
+            return json({ achievements: [] });
+          }
+          return error(message, 500);
+        }
+      }
+
       // ─── 404 ───────────────────────────────────────────
       return error("Not found", 404);
 
