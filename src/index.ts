@@ -1,13 +1,17 @@
 /**
- * Lucineer Persistent Memory System - Worker API
- * 
+ * Lucineer Persistent Memory System — Worker API
+ *
  * Provides REST endpoints for player profiles, build history,
  * skills library, conversations, and world state.
+ *
+ * Phase 1 Day 1: Uniform shared-secret auth. Every endpoint except
+ * /api/health requires X-Lucineer-Key matching LUCINEER_SHARED_SECRET.
  */
 
 export interface Env {
   DB: D1Database;
-  LUCINEER_KEY: string;
+  /** Shared secret — must match X-Lucineer-Key header on all non-health routes. */
+  LUCINEER_SHARED_SECRET: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -23,17 +27,24 @@ function error(message: string, status = 400): Response {
   return json({ error: message }, status);
 }
 
-// ─── Auth ───────────────────────────────────────────────
+// ─── Auth Middleware ─────────────────────────────────────
 
-function isAuthorized(request: Request, env: Env): boolean {
+/**
+ * Uniform auth check: every non-health endpoint must pass through this.
+ * Reads X-Lucineer-Key header and compares to LUCINEER_SHARED_SECRET.
+ * Returns null if authorized, or a 401 Response if not.
+ */
+function requireAuth(request: Request, env: Env): Response | null {
   const key = request.headers.get("X-Lucineer-Key");
-  const expected = env.LUCINEER_KEY;
-  if (!expected) return false; // fail-closed if key not configured
-  return key === expected;
-}
-
-function unauthorized(): Response {
-  return json({ error: "Unauthorized" }, 401);
+  const expected = env.LUCINEER_SHARED_SECRET;
+  if (!expected) {
+    // Fail-closed: if the secret isn't configured, nothing works.
+    return json({ error: "Server misconfigured: LUCINEER_SHARED_SECRET not set" }, 500);
+  }
+  if (!key || key !== expected) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+  return null; // authorized
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -52,15 +63,27 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // Health check — no auth required
-    if (path === "/" || path === "/health") {
-      return json({ status: "ok", service: "lucineer-memory", time: new Date().toISOString() });
+    // ─── Health check — the ONLY endpoint that skips auth ───
+    if (path === "/api/health" && method === "GET") {
+      return json({
+        status: "ok",
+        service: "lucineer-memory",
+        time: new Date().toISOString(),
+      });
     }
 
-    // Auth gate — all endpoints below require X-Lucineer-Key
-    if (!isAuthorized(request, env)) {
-      return unauthorized();
+    // Also accept legacy health paths
+    if ((path === "/" || path === "/health") && method === "GET") {
+      return json({
+        status: "ok",
+        service: "lucineer-memory",
+        time: new Date().toISOString(),
+      });
     }
+
+    // ─── Auth gate — every endpoint below requires the shared secret ───
+    const authFailure = requireAuth(request, env);
+    if (authFailure) return authFailure;
 
     try {
       // ─── Player Profiles ───────────────────────────────
