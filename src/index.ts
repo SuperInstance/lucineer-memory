@@ -94,16 +94,21 @@ export default {
         if (!playerName) return error("player_name is required");
 
         const preferences = JSON.stringify(body.preferences || {});
-        const bondLevel = Number(body.bond_level ?? 0);
+        // COALESCE: if bond_level is null/undefined, preserve existing value.
+        // This fixes the bug where omitting bond_level silently reset it to 0.
+        const bondLevelRaw = body.bond_level;
+        const bondLevel = bondLevelRaw === undefined || bondLevelRaw === null
+          ? null
+          : Number(bondLevelRaw);
 
         await env.DB.prepare(
           `INSERT INTO player_profiles (player_name, preferences, bond_level, first_seen, last_seen)
            VALUES (?, ?, ?, datetime('now'), datetime('now'))
            ON CONFLICT(player_name) DO UPDATE SET
              preferences = excluded.preferences,
-             bond_level = excluded.bond_level,
+             bond_level = COALESCE(?, player_profiles.bond_level),
              last_seen = datetime('now')`
-        ).bind(playerName, preferences, bondLevel).run();
+        ).bind(playerName, preferences, bondLevel, bondLevel).run();
 
         return json({ success: true, player_name: playerName });
       }
@@ -347,7 +352,9 @@ export default {
 
     } catch (err) {
       const message = err instanceof Error ? err.message : "Unknown error";
-      return error(message, 500);
+      // parseBody errors are client errors (400), not server errors (500)
+      const status = message.includes("Invalid JSON") ? 400 : 500;
+      return error(message, status);
     }
   },
 };
