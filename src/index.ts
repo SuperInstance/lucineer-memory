@@ -7,6 +7,7 @@
 
 export interface Env {
   DB: D1Database;
+  LUCINEER_KEY: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────
@@ -20,6 +21,19 @@ function json(data: unknown, status = 200): Response {
 
 function error(message: string, status = 400): Response {
   return json({ error: message }, status);
+}
+
+// ─── Auth ───────────────────────────────────────────────
+
+function isAuthorized(request: Request, env: Env): boolean {
+  const key = request.headers.get("X-Lucineer-Key");
+  const expected = env.LUCINEER_KEY;
+  if (!expected) return false; // fail-closed if key not configured
+  return key === expected;
+}
+
+function unauthorized(): Response {
+  return json({ error: "Unauthorized" }, 401);
 }
 
 async function parseBody(request: Request): Promise<Record<string, unknown>> {
@@ -38,9 +52,14 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // Health check
+    // Health check — no auth required
     if (path === "/" || path === "/health") {
       return json({ status: "ok", service: "lucineer-memory", time: new Date().toISOString() });
+    }
+
+    // Auth gate — all endpoints below require X-Lucineer-Key
+    if (!isAuthorized(request, env)) {
+      return unauthorized();
     }
 
     try {
