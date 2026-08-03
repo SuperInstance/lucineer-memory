@@ -10,6 +10,8 @@
 
 export interface Env {
   DB: D1Database;
+  /** R2 bucket for large save data (build snapshots, terrain, legacy builds). */
+  SAVES: R2Bucket;
   /** Shared secret — must match X-Lucineer-Key header on all non-health routes. */
   LUCINEER_SHARED_SECRET: string;
 }
@@ -345,6 +347,185 @@ export default {
           }
           return error(message, 500);
         }
+      }
+
+      // ─── Save System: R2 Build Snapshots ──────────────
+
+      // POST /api/save/r2/:playerName — save build snapshot to R2
+      if (path.startsWith("/api/save/r2/") && method === "POST") {
+        const r2Key = decodeURIComponent(path.split("/api/save/r2/")[1]);
+        if (!r2Key) return error("R2 key (playerName or path) is required");
+
+        const body = await parseBody(request);
+        // Accept base64-encoded snapshot in "data" or "save_data"
+        const data = String(body.data || body.save_data || "");
+        if (!data) return error("data (base64-encoded snapshot) is required");
+
+        await env.SAVES.put(r2Key, data);
+        return json({ success: true, key: r2Key });
+      }
+
+      // GET /api/save/r2/:playerName — load build snapshot from R2
+      if (path.startsWith("/api/save/r2/") && method === "GET") {
+        const r2Key = decodeURIComponent(path.split("/api/save/r2/")[1]);
+        if (!r2Key) return error("R2 key (playerName or path) is required");
+
+        const object = await env.SAVES.get(r2Key);
+        if (!object) return error("not found", 404);
+        const text = await object.text();
+        return json({ data: text, key: r2Key });
+      }
+
+      // ─── Save System: D1 Key-Value Store ───────────────
+
+      // POST /api/save/d1/:playerName/:key — upsert a save value
+      if (path.startsWith("/api/save/d1/") && method === "POST") {
+        const parts = path.split("/api/save/d1/")[1].split("/");
+        const playerName = decodeURIComponent(parts[0] || "");
+        const saveKey = parts[1] || "";
+        if (!playerName || !saveKey) return error("playerName and key are required");
+
+        const body = await parseBody(request);
+        const saveData = String(body.save_data ?? body.data ?? "");
+        if (!saveData) return error("save_data is required");
+
+        await env.DB.prepare(
+          `INSERT INTO player_saves (player_name, save_key, save_data, updated_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(player_name, save_key) DO UPDATE SET
+             save_data = excluded.save_data,
+             updated_at = excluded.updated_at`
+        ).bind(playerName, saveKey, saveData, Math.floor(Date.now() / 1000)).run();
+
+        return json({ success: true, player_name: playerName, key: saveKey });
+      }
+
+      // GET /api/save/d1/:playerName/all — batch load all saves for a player
+      if (path.match(/^\/api\/save\/d1\/[^/]+\/all$/) && method === "GET") {
+        const playerName = decodeURIComponent(
+          path.split("/api/save/d1/")[1].replace(/\/all$/, "")
+        );
+        if (!playerName) return error("player name is required");
+
+        const results = await env.DB.prepare(
+          `SELECT save_key, save_data, updated_at FROM player_saves WHERE player_name = ?`
+        ).bind(playerName).all();
+
+        return json({ saves: results.results || [] });
+      }
+
+      // GET /api/save/d1/:playerName/:key — read a specific save value
+      if (path.startsWith("/api/save/d1/") && method === "GET") {
+        const parts = path.split("/api/save/d1/")[1].split("/");
+        const playerName = decodeURIComponent(parts[0] || "");
+        const saveKey = parts[1] || "";
+        if (!playerName || !saveKey) return error("playerName and key are required");
+
+        const result = await env.DB.prepare(
+          `SELECT save_data FROM player_saves WHERE player_name = ? AND save_key = ?`
+        ).bind(playerName, saveKey).first();
+
+        if (!result) return error("not found", 404);
+        return json({ save_data: result.save_data, player_name: playerName, key: saveKey });
+      }
+
+      // ─── Era Progression ───────────────────────────────
+
+      // GET /api/era/:playerName — load era progression data
+      if (path.startsWith("/api/era/") && method === "GET") {
+        const playerName = decodeURIComponent(path.split("/api/era/")[1]);
+        if (!playerName) return error("player name is required");
+
+        // Try the dedicated player_eras table first
+        let eraResult;
+        try {
+          eraResult = await env.DB.prepare(
+            `SELECT current_era, unlocked_eras, era_xp, updated_at
+             FROM player_eras WHERE player_name = ?`
+          ).bind(playerName).first();
+        } catch {
+          // player_eras table might not exist yet — fall back to player_saves
+        }
+
+        if (eraResult) {
+          return json({
+            player_name: playerName,
+            current_era: eraResult.current_era,
+            unlocked_eras: eraResult.unlocked_eras
+              ? JSON.parse(eraResult.unlocked_eras as string)
+              : [0],
+            era_xp: eraResult.era_xp
+              ? JSON.parse(eraResult.era_xp as string)
+              : {},
+            updated_at: eraResult.updated_at,
+          });
+        }
+
+        // Fallback: check player_saves for an era key
+        const saveResult = await env.DB.prepare(
+          `SELECT save_data FROM player_saves WHERE player_name = ? AND save_key = 'era'`
+        ).bind(playerName).first();
+
+        if (saveResult) {
+          const eraData = JSON.parse(saveResult.save_data as string);
+          return json({
+            player_name: playerName,
+            ...eraData,
+          });
+        }
+
+        // Default: era 0, nothing unlocked beyond starting era
+        return json({
+          player_name: playerName,
+          current_era: 0,
+          unlocked_eras: [0],
+          era_xp: {},
+        });
+      }
+
+      // POST /api/era/:playerName — save era progression data
+      if (path.startsWith("/api/era/") && method === "POST") {
+        const playerName = decodeURIComponent(path.split("/api/era/")[1]);
+        if (!playerName) return error("player name is required");
+
+        const body = await parseBody(request);
+        const currentEra = Number(body.current_era ?? 0);
+        const unlockedEras = JSON.stringify(body.unlocked_eras ?? [0]);
+        const eraXp = JSON.stringify(body.era_xp ?? {});
+        const now = Math.floor(Date.now() / 1000);
+
+        // Try player_eras table first
+        try {
+          await env.DB.prepare(
+            `INSERT INTO player_eras (player_name, current_era, unlocked_eras, era_xp, updated_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(player_name) DO UPDATE SET
+               current_era = excluded.current_era,
+               unlocked_eras = excluded.unlocked_eras,
+               era_xp = excluded.era_xp,
+               updated_at = excluded.updated_at`
+          ).bind(playerName, currentEra, unlockedEras, eraXp, now).run();
+          return json({ success: true, player_name: playerName });
+        } catch {
+          // player_eras table might not exist — fall back to player_saves
+        }
+
+        // Fallback: store as a player_saves entry
+        const eraData = JSON.stringify({
+          current_era: currentEra,
+          unlocked_eras: body.unlocked_eras ?? [0],
+          era_xp: body.era_xp ?? {},
+        });
+
+        await env.DB.prepare(
+          `INSERT INTO player_saves (player_name, save_key, save_data, updated_at)
+           VALUES (?, 'era', ?, ?)
+           ON CONFLICT(player_name, save_key) DO UPDATE SET
+             save_data = excluded.save_data,
+             updated_at = excluded.updated_at`
+        ).bind(playerName, eraData, now).run();
+
+        return json({ success: true, player_name: playerName });
       }
 
       // ─── 404 ───────────────────────────────────────────
