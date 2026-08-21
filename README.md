@@ -259,7 +259,7 @@ npx wrangler secret put LUCINEER_SHARED_SECRET
 |-----------|------|
 | [lucineer-worker](../lucineer-worker) | Job relay, hosts the processor daemon |
 | [lucineer-vector](../lucineer-vector) | Semantic skill search (Vectorize) |
-| [lucineer-brain](../lucineer-brain) | Multi-model pipeline consuming memory context |
+| [lucineer-system](../lucineer-system) | Multi-model pipeline consuming memory context |
 | [lucineer-roblox](../lucineer-roblox) | Roblox client (indirect consumer via processor) |
 
 ---
